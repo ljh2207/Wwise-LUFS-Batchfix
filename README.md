@@ -2,6 +2,8 @@
 
 Wwise Authoring Tool의 **Tools 메뉴**에서 실행하는 LUFS 측정 도구.  
 선택한 Sound 오브젝트(또는 컨테이너)의 원본 WAV 파일에 대해 **Integrated LUFS, Sample Peak, RMS, 채널 수, 길이**를 측정하고 표로 표시합니다.
+<img width="1217" height="743" alt="image" src="https://github.com/user-attachments/assets/332fff75-24ae-4788-a208-a114346c7e28" />
+
 
 ---
 
