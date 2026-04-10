@@ -219,7 +219,7 @@ class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("Wwise LUFS Meter")
+        self.title("Wwise LUFS BatchFix")
         self.minsize(640, 420)
         self.configure(bg=self.BG)
         self._restore_geometry()
@@ -323,7 +323,7 @@ class App(tk.Tk):
 
         left = ttk.Frame(header)
         left.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(left, text="Wwise LUFS Meter", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(left, text="Wwise LUFS BatchFix", style="Title.TLabel").pack(anchor="w")
 
         legend_frame = ttk.Frame(left)
         legend_frame.pack(anchor="w", pady=(2, 0))
