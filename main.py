@@ -29,6 +29,24 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 # ─── LUFS 측정 ──────────────────────────────────────────────────────────────
 
 SHORT_FILE_THRESHOLD = 1.0  # 초 미만은 LUFS 대신 Peak/RMS 표시
+PYLN_SUPPORTED_CH = {1, 2, 5, 6}  # pyloudnorm 네이티브 지원 채널 수
+_C = 1.0 / 2 ** 0.5  # ITU-R BS.775 center/surround 계수 (~0.707)
+
+
+def _fold_to_stereo(data: np.ndarray) -> np.ndarray | None:
+    """미지원 채널을 ITU-R BS.775 계수로 스테레오 fold-down. 불가능하면 None 반환.
+    7ch/8ch는 WAV 채널 마스크를 확인할 수 없으므로 측정 불가 처리."""
+    ch = data.shape[1]
+    if ch == 3:    # L R C
+        L = data[:, 0] + _C * data[:, 2]
+        R = data[:, 1] + _C * data[:, 2]
+    elif ch == 4:  # L R Ls Rs
+        L = data[:, 0] + _C * data[:, 2]
+        R = data[:, 1] + _C * data[:, 3]
+    else:
+        return None
+    return np.stack([L, R], axis=1)
+
 
 def measure_file(path: str) -> dict:
     try:
@@ -43,11 +61,25 @@ def measure_file(path: str) -> dict:
         rms_linear = float(np.sqrt(np.mean(data ** 2)))
         rms_db = 20 * np.log10(rms_linear) if rms_linear > 0 else -96.0
 
+        ch_downmixed = False
         if short:
             lufs = None
         else:
             meter = pyln.Meter(rate)
-            meas_data = data[:, : min(channels, 2)]
+            if channels in PYLN_SUPPORTED_CH:
+                meas_data = data
+            else:
+                meas_data = _fold_to_stereo(data)
+                if meas_data is None:
+                    return {
+                        "lufs": None, "peak_db": peak_db, "rms_db": rms_db,
+                        "duration": duration, "channels": channels,
+                        "sample_rate": rate, "short": short,
+                        "ch_downmixed": True,
+                        "error": f"{channels}ch: 지원되지 않는 채널 수 (측정 불가)",
+                    }
+                ch_downmixed = True
+                meter = pyln.Meter(rate)  # fold된 2ch 기준으로 재생성
             try:
                 lufs = meter.integrated_loudness(meas_data)
             except Exception:
@@ -56,13 +88,15 @@ def measure_file(path: str) -> dict:
         return {
             "lufs": lufs, "peak_db": peak_db, "rms_db": rms_db,
             "duration": duration, "channels": channels,
-            "sample_rate": rate, "short": short, "error": None,
+            "sample_rate": rate, "short": short,
+            "ch_downmixed": ch_downmixed, "error": None,
         }
     except Exception as e:
         return {
             "lufs": None, "peak_db": None, "rms_db": None,
             "duration": None, "channels": None,
-            "sample_rate": None, "short": False, "error": str(e),
+            "sample_rate": None, "short": False,
+            "ch_downmixed": False, "error": str(e),
         }
 
 
@@ -204,6 +238,121 @@ def fmt_lufs(v):
     return f"{v:.1f}"
 
 
+# ─── 색상 유틸 ───────────────────────────────────────────────────────────────
+
+def _shift_color(hex_col: str, delta: int) -> str:
+    """RGB 각 채널을 delta만큼 밝게(+) / 어둡게(-) 조정."""
+    h = hex_col.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#{:02x}{:02x}{:02x}".format(
+        max(0, min(255, r + delta)),
+        max(0, min(255, g + delta)),
+        max(0, min(255, b + delta)),
+    )
+
+
+# ─── 둥근 버튼 ───────────────────────────────────────────────────────────────
+
+class RoundedButton(tk.Canvas):
+    """Canvas 기반 border-radius 버튼."""
+
+    def __init__(self, parent, text="", command=None,
+                 bg="#e8a400", fg="#1a1a1a",
+                 font=("Segoe UI", 11, "bold"),
+                 hover_bg=None, active_bg=None,
+                 disabled_bg="#383838", disabled_fg="#5a5a5a",
+                 radius=8, padx=16, pady=5,
+                 canvas_bg="#2b2b2b",
+                 state="normal", **kwargs):
+
+        self._bg_normal   = bg
+        self._fg_normal   = fg
+        self._bg_hover    = hover_bg  or _shift_color(bg,  20)
+        self._bg_active   = active_bg or _shift_color(bg, -20)
+        self._bg_disabled = disabled_bg
+        self._fg_disabled = disabled_fg
+        self._radius  = radius
+        self._command = command
+        self._enabled = (state == "normal")
+
+        _font = tkfont.Font(family=font[0], size=font[1],
+                            weight=font[2] if len(font) > 2 else "normal")
+        tw = _font.measure(text)
+        th = _font.metrics("linespace")
+        w  = tw + padx * 2
+        h  = th + pady * 2
+
+        super().__init__(parent, width=w, height=h,
+                         bg=canvas_bg, highlightthickness=0, bd=0,
+                         cursor="hand2" if self._enabled else "arrow", **kwargs)
+
+        self._cw, self._ch = w, h
+        self._text = text
+        self._font = _font
+
+        self._redraw(
+            self._bg_normal   if self._enabled else self._bg_disabled,
+            self._fg_normal   if self._enabled else self._fg_disabled,
+        )
+        self.bind("<Enter>",           self._on_enter)
+        self.bind("<Leave>",           self._on_leave)
+        self.bind("<ButtonPress-1>",   self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    # ── 그리기 ──
+
+    def _redraw(self, fill: str, fg: str):
+        self.delete("all")
+        r, w, h = self._radius, self._cw, self._ch
+        for args in [
+            (r, 0, w - r, h),
+            (0, r, w, h - r),
+        ]:
+            self.create_rectangle(*args, fill=fill, outline="")
+        for ox, oy in [(0, 0), (w - r*2, 0), (0, h - r*2), (w - r*2, h - r*2)]:
+            self.create_oval(ox, oy, ox + r*2, oy + r*2, fill=fill, outline="")
+        self.create_text(w // 2, h // 2, text=self._text,
+                         fill=fg, font=self._font, anchor="center")
+
+    # ── 이벤트 ──
+
+    def _on_enter(self, _):
+        if self._enabled:
+            self._redraw(self._bg_hover, self._fg_normal)
+
+    def _on_leave(self, _):
+        if self._enabled:
+            self._redraw(self._bg_normal, self._fg_normal)
+
+    def _on_press(self, _):
+        if self._enabled:
+            self._redraw(self._bg_active, self._fg_normal)
+
+    def _on_release(self, event):
+        if not self._enabled:
+            return
+        self._redraw(self._bg_normal, self._fg_normal)
+        if 0 <= event.x <= self._cw and 0 <= event.y <= self._ch and self._command:
+            self._command()
+
+    # ── 공개 API (ttk.Button 호환) ──
+
+    def configure(self, **kwargs):
+        state = kwargs.pop("state", None)
+        if state == "disabled":
+            self._enabled = False
+            self._redraw(self._bg_disabled, self._fg_disabled)
+            super().configure(cursor="arrow")
+        elif state == "normal":
+            self._enabled = True
+            self._redraw(self._bg_normal, self._fg_normal)
+            super().configure(cursor="hand2")
+        if kwargs:
+            super().configure(**kwargs)
+
+    config = configure
+
+
 # ─── UI ─────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -230,6 +379,7 @@ class App(tk.Tk):
         self._checked:        dict[str, bool] = {}
         self._last_check_iid: str | None = None
         self._truncate_job = None
+        self._closing = False
         self._build_style()
         self._build_ui()
 
@@ -242,12 +392,21 @@ class App(tk.Tk):
             self.geometry("960x620")
 
     def _on_close(self):
+        self._closing = True
         try:
             with open(CONFIG_PATH, "w") as f:
                 json.dump({"geometry": self.wm_geometry()}, f)
         except Exception:
             pass
         self.destroy()
+
+    def _safe_after(self, ms: int, func):
+        if self._closing:
+            return
+        try:
+            self.after(ms, func)
+        except tk.TclError:
+            pass
 
     # ── 스타일 ──
 
@@ -260,30 +419,6 @@ class App(tk.Tk):
         style.configure("Title.TLabel", background=self.BG,        foreground=self.FG,     font=("Segoe UI", 13, "bold"))
         style.configure("Dim.TLabel",   background=self.BG,        foreground=self.FG_DIM, font=("Segoe UI", 10))
         style.configure("Status.TLabel",background=self.BG,        foreground=self.FG_DIM, font=("Segoe UI", 10))
-
-        style.configure("Measure.TButton",
-            background=self.ACCENT, foreground="#1a1a1a",
-            font=("Segoe UI", 11, "bold"), relief="flat", padding=(12, 4),
-            borderwidth=0)
-        style.map("Measure.TButton",
-            background=[("active", "#f0b800"), ("disabled", "#4a4a4a")],
-            foreground=[("disabled", "#6a6a6a")])
-
-        style.configure("Copy.TButton",
-            background=self.BG_HEADER, foreground=self.FG,
-            font=("Segoe UI", 11), relief="flat", padding=(12, 4),
-            borderwidth=0)
-        style.map("Copy.TButton",
-            background=[("active", "#4a4a4a"), ("disabled", "#2b2b2b")],
-            foreground=[("disabled", "#5a5a5a")])
-
-        style.configure("Normalize.TButton",
-            background="#3a5a3a", foreground=self.FG,
-            font=("Segoe UI", 11), relief="flat", padding=(12, 4),
-            borderwidth=0)
-        style.map("Normalize.TButton",
-            background=[("active", "#4a7a4a"), ("disabled", "#2b2b2b")],
-            foreground=[("disabled", "#5a5a5a")])
 
         SEP = "#555555"
         style.configure("Treeview",
@@ -341,34 +476,55 @@ class App(tk.Tk):
             dot.create_rectangle(0, 0, 10, 10, fill=f"#{hex_col}", outline="")
             ttk.Label(legend_frame, text=label, style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
 
+        # grid 2열: 왼쪽(col=0) TSV복사/Target컨트롤, 오른쪽(col=1) 측정/볼륨적용
         btn_frame = ttk.Frame(header)
         btn_frame.pack(side=tk.RIGHT, anchor="n")
 
-        self.copy_btn = ttk.Button(btn_frame, text="TSV 복사", style="Copy.TButton",
-                                   state="disabled", command=self._on_copy)
-        self.copy_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.copy_btn = RoundedButton(
+            btn_frame, text="TSV 복사",
+            bg="#484848", fg=self.FG,
+            font=("Segoe UI", 11, "normal"),
+            state="disabled", command=self._on_copy,
+            canvas_bg=self.BG,
+        )
+        self.copy_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
 
-        # Target LUFS 입력
-        ttk.Label(btn_frame, text="Target:", style="Dim.TLabel").pack(side=tk.LEFT)
+        self.measure_btn = RoundedButton(
+            btn_frame, text="측정",
+            bg=self.ACCENT, fg="#1a1a1a",
+            font=("Segoe UI", 11, "bold"),
+            command=self._on_measure,
+            canvas_bg=self.BG,
+        )
+        self.measure_btn.grid(row=0, column=1, sticky="e")
+
+        # Target LUFS 컨트롤 — col=0에 sub-frame으로 배치
+        target_frame = ttk.Frame(btn_frame)
+        target_frame.grid(row=1, column=0, sticky="e", padx=(0, 8), pady=(6, 0))
+
+        ttk.Label(target_frame, text="Target:", style="Dim.TLabel").pack(side=tk.LEFT)
         self.target_lufs_var = tk.StringVar(value="-14.0")
         self._target_spinbox = tk.Spinbox(
-            btn_frame, textvariable=self.target_lufs_var,
+            target_frame, textvariable=self.target_lufs_var,
             from_=-60.0, to=0.0, increment=0.5, width=6, format="%.1f",
             bg="#3c3c3c", fg=self.FG, insertbackground=self.FG,
             buttonbackground="#4a4a4a", relief="flat",
             font=("Segoe UI", 11), highlightthickness=0,
         )
         self._target_spinbox.pack(side=tk.LEFT, padx=(4, 2))
-        ttk.Label(btn_frame, text="LUFS", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(target_frame, text="LUFS", style="Dim.TLabel").pack(side=tk.LEFT)
 
-        self.normalize_btn = ttk.Button(btn_frame, text="볼륨 적용",
-                                        style="Normalize.TButton",
-                                        state="disabled", command=self._on_normalize)
-        self.normalize_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.measure_btn = ttk.Button(btn_frame, text="측정", style="Measure.TButton",
-                                      command=self._on_measure)
-        self.measure_btn.pack(side=tk.LEFT)
+        self.normalize_btn = RoundedButton(
+            btn_frame, text="볼륨 적용",
+            bg="#2e7d52", fg="#ffffff",
+            font=("Segoe UI", 11, "normal"),
+            state="disabled", command=self._on_normalize,
+            canvas_bg=self.BG,
+        )
+        self.normalize_btn.grid(row=1, column=1, sticky="e", pady=(6, 0))
+        ttk.Label(btn_frame, text="※ 기존 Volume을 덮어씁니다",
+                  style="Dim.TLabel").grid(row=2, column=0, columnspan=2,
+                                           sticky="e", pady=(2, 0))
 
         # 구분선
         sep = tk.Frame(root_frame, height=1, bg=self.BG_HEADER)
@@ -477,6 +633,7 @@ class App(tk.Tk):
             target_state = self._checked.get(self._last_check_iid, False)
             for iid in all_iids[lo: hi + 1]:
                 self._set_check(iid, target_state)
+            self._last_check_iid = row
         else:
             self._toggle_check(row)
 
@@ -522,15 +679,15 @@ class App(tk.Tk):
 
     def _run_measure(self):
         if not AUDIO_OK:
-            self.after(0, self._finish, [], f"오디오 라이브러리 오류: {AUDIO_ERR}")
+            self._safe_after(0, lambda: self._finish([], f"오디오 라이브러리 오류: {AUDIO_ERR}"))
             return
 
         sources, err = fetch_sources()
         if err:
-            self.after(0, self._finish, [], err)
+            self._safe_after(0, lambda: self._finish([], err))
             return
 
-        self.after(0, lambda: self.status_var.set(f"{len(sources)}개 파일 측정 중..."))
+        self._safe_after(0, lambda: self.status_var.set(f"{len(sources)}개 파일 측정 중..."))
 
         results = []
         ok_count = 0
@@ -549,8 +706,8 @@ class App(tk.Tk):
 
             results.append((src, meas))
 
-        self.after(0, self._finish, results,
-                   f"완료: {ok_count}개 측정됨" + (f", {err_count}개 오류" if err_count else ""))
+        msg = f"완료: {ok_count}개 측정됨" + (f", {err_count}개 오류" if err_count else "")
+        self._safe_after(0, lambda: self._finish(results, msg))
 
     def _finish(self, results, msg):
         self.progress.stop()
@@ -573,6 +730,7 @@ class App(tk.Tk):
                 self.rows_data.append({"object": obj, "file": fname,
                     "lufs": None, "rms": None, "peak": None,
                     "channels": None, "duration": None, "short": False,
+                    "ch_downmixed": False,
                     "object_id": src.get("object_id", ""),
                     "object_path": src.get("object_path", ""),
                     "iid": iid})
@@ -589,6 +747,8 @@ class App(tk.Tk):
             dur_str  = f"{dur:.2f}s"      if dur  is not None else "—"
             ch_str   = str(ch) if ch else "—"
 
+            ch_downmixed = meas.get("ch_downmixed", False) if meas else False
+
             if short:
                 short_count += 1
                 rms_str  = f"{rms:.1f} dB" if rms is not None else "—"
@@ -596,7 +756,8 @@ class App(tk.Tk):
                 tag = "short"
                 self.tree.tag_configure("short", foreground="#ffcc02")
             else:
-                lufs_str = f"{fmt_lufs(lufs)} LUFS"
+                suffix = " [Downmix]" if ch_downmixed else ""
+                lufs_str = f"{fmt_lufs(lufs)} LUFS{suffix}"
                 tag = f"lufs_{lufs_color(lufs).lstrip('#')}"
                 self.tree.tag_configure(tag, foreground=lufs_color(lufs))
 
@@ -608,6 +769,7 @@ class App(tk.Tk):
             self.rows_data.append({"object": obj, "file": fname,
                 "lufs": lufs, "rms": rms, "peak": peak,
                 "channels": ch, "duration": dur, "short": short,
+                "ch_downmixed": ch_downmixed,
                 "object_id": src.get("object_id", ""),
                 "object_path": src.get("object_path", ""),
                 "iid": iid})
@@ -616,7 +778,7 @@ class App(tk.Tk):
         if any(r["peak"] is not None for r in self.rows_data):
             self.copy_btn.configure(state="normal")
         has_normalizable = any(
-            r.get("lufs") is not None and r.get("object_id")
+            r.get("lufs") is not None and r.get("object_id") and not r.get("ch_downmixed")
             for r in self.rows_data
         )
         if has_normalizable:
@@ -661,6 +823,9 @@ class App(tk.Tk):
                     if r.get("lufs") is None or not r.get("object_path"):
                         skipped += 1
                         continue
+                    if r.get("ch_downmixed"):
+                        skipped += 1
+                        continue
 
                     obj_path = r["object_path"]
                     # Volume = target - source_lufs (절대값 계산, 기존 Volume 무관)
@@ -678,19 +843,19 @@ class App(tk.Tk):
 
             status_msg = f"볼륨 적용 완료: {adjusted}개 조정됨"
             if skipped:
-                status_msg += f", {skipped}개 건너뜀 (1초 미만 또는 오류)"
+                status_msg += f", {skipped}개 건너뜀 (1초 미만 / 다운믹스 / 오류)"
             toast_msg = f"✓  볼륨 적용 완료  —  {adjusted}개 조정됨"
-            self.after(0, lambda s=status_msg, t=toast_msg: (
+            self._safe_after(0, lambda s=status_msg, t=toast_msg: (
                 self.status_var.set(s), self._show_toast(t)))
 
         except CannotConnectToWaapiException:
-            self.after(0, lambda: self.status_var.set(
+            self._safe_after(0, lambda: self.status_var.set(
                 "Wwise 연결 실패 — WAAPI 활성화 확인"))
         except Exception as e:
-            self.after(0, lambda m=str(e): self.status_var.set(f"볼륨 적용 오류: {m}"))
+            self._safe_after(0, lambda m=str(e): self.status_var.set(f"볼륨 적용 오류: {m}"))
         finally:
-            self.after(0, lambda: self.normalize_btn.configure(state="normal"))
-            self.after(0, lambda: self.measure_btn.configure(state="normal"))
+            self._safe_after(0, lambda: self.normalize_btn.configure(state="normal"))
+            self._safe_after(0, lambda: self.measure_btn.configure(state="normal"))
 
     def _show_toast(self, message: str):
         overlay = tk.Frame(self, bg="#1a1a1a")
